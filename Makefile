@@ -10,9 +10,9 @@ LDFLAGS := $(shell root-config --glibs) $(STDLIBDIR) -lMathMore
 CPPFLAGS += -g
 
 TARGET1 = razor
-OBJ1 = razor.o
-OBJ2 = jsoncpp.o
-#OBJ3 = razor_cuda.o
+OBJ1 = jsoncpp.o
+OBJ2 = razor_cuda.o
+OBJ3 = razor.o
 
 all : $(TARGET1)
 
@@ -23,8 +23,13 @@ $(TARGET1) : $(OBJ1) $(OBJ2) $(OBJ3)
 	@echo $<
 	@echo $^
 
-%.o : %.cu %.cpp %.cc
+%.o : %.cpp %.cc
 	$(CXX) $(CPPFLAGS) -o $@ -c $<
+	@echo $@
+	@echo $<
+
+%.o : %.cu
+	nvcc $(CPPFLAGS) -o $@ -c $<
 	@echo $@
 	@echo $<
 
