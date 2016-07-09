@@ -6,12 +6,9 @@
 
 #include <iostream>
 #include <fstream>
-#include <TLorentzVector.h>
 #include <cuda_runtime.h>
 
 #include "include/razor.h"
-#include "include/json.h"
-#include "include/razor_cuda.cuh"
 
 typedef unsigned int uint;
 
@@ -42,11 +39,12 @@ int main (int argc, char **argv) {
         return 0;
     }
 
+    std::cout << "Reading file..." << std::endl;
     // Create array of vectors to store jet data and razor variables later
     std::cout << "Dataset Size: " << obj.size() << std::endl;
 
-    std::vector<TLorentzVector> **jet_array = new std::vector<TLorentzVector> *[obj.size()];
-    TLorentzVector *met_array = new TLorentzVector[obj.size()];
+    std::vector<Vector> **jet_array = new std::vector<Vector> *[obj.size()];
+    Vector *met_array = new Vector[obj.size()];
     double *razor_array = new double[2 * obj.size()];
 /*
     double **razor_array = new double *[obj.size()];
@@ -54,10 +52,13 @@ int main (int argc, char **argv) {
         razor_array[i] = new double[2];
 */
     // fill vectors
+    std::cout << "Filling vectors in memory with data from file" << std::endl;
     parseJSON(obj, jet_array, met_array);
 
     // analyzse data in batches in parallel
+    std::cout << "Initializing parallel computations" << std::endl;
     runjobs(jet_array, razor_array, met_array, obj.size());
+    std::cout << "Finished parallel computations" << std::endl;
 
     // output razor array results:
     for (int i = 0; i < obj.size(); i += 2)
@@ -76,37 +77,36 @@ int main (int argc, char **argv) {
 /*
  * Read list of events from json file to and return array of vectors
  */
-void parseJSON(Json::Value &obj, std::vector<TLorentzVector> **jet_array,
-               TLorentzVector *met_array) {
+void parseJSON(Json::Value &obj, std::vector<Vector> **jet_array,
+               Vector *met_array) {
 
     // iterate through array of events in json file
     Json::ValueIterator iter;
     int index;
     for (iter = obj.begin(), index = 0; iter != obj.end(); iter++, index++) {
         
-        jet_array[index] = new std::vector<TLorentzVector>(0);
+        jet_array[index] = new std::vector<Vector>(0);
 
         // iterate through all the jets in this particular event
         for (Json::ValueIterator jet_iter = (*iter)["event"]["jets"].begin();
                 jet_iter != (*iter)["event"]["jets"].end(); jet_iter++) {
 
-            TLorentzVector vec;
+            Vector vec;
             
             //std::cout << (*jet_iter)["pt"].asDouble() << " " << (*jet_iter)["eta"].asDouble()
             //   << " " << (*jet_iter)["phi"].asDouble() << " " << (*jet_iter)["m"].asDouble() << std::endl;
             
-            vec.SetPtEtaPhiM(
+            vec.SetPtEtaPhi(
                     (*jet_iter)["pt"].asDouble() ,
                     (*jet_iter)["eta"].asDouble(),
-                    (*jet_iter)["phi"].asDouble(),
-                    (*jet_iter)["m"].asDouble() );
+                    (*jet_iter)["phi"].asDouble());
             jet_array[index]->push_back(vec);
         }
 
         // obtain MET from event
-        met_array[index].SetPtEtaPhiM(
+        met_array[index].SetPtEtaPhi(
                     (*iter)["pt"].asDouble() , 0,
-                    (*iter)["phi"].asDouble(), 0);
+                    (*iter)["phi"].asDouble());
     }
 }
 
@@ -114,8 +114,8 @@ void parseJSON(Json::Value &obj, std::vector<TLorentzVector> **jet_array,
 /*
  * Run data analysis in parallel in batches, based on available GPU memory
  */
-void runjobs(std::vector<TLorentzVector> **jet_array, double *razor_array,
-             TLorentzVector *met_array, int tot_size) {
+void runjobs(std::vector<Vector> **jet_array, double *razor_array,
+             Vector *met_array, int tot_size) {
 
     // maximum number of jets in this batch of vectors
     int max_njets = 0;
@@ -136,7 +136,7 @@ void runjobs(std::vector<TLorentzVector> **jet_array, double *razor_array,
         // overall memory to be used by this batch of vectors, pick max
         // see runbatch function: batch # * combination * result * vector arrays
         int memory_use = (operations + add_operations) * (
-                    sizeof(uint) + 3 * sizeof(double) + sizeof(TLorentzVector)
+                    sizeof(uint) + 3 * sizeof(double) + sizeof(Vector)
                     * (1 + (max_njets < njets ? njets : max_njets)));
 
         // If there is enough memory left, add vector to batch and continue
@@ -152,8 +152,8 @@ void runjobs(std::vector<TLorentzVector> **jet_array, double *razor_array,
         else {
 
             // run computation on these -- nb: 2nd index not inclusive
-            runbatch(jet_array, razor_array, met_array, batch_begin, iter, max_njets, operations);
             std::cout << "Processing: " << batch_begin << " - " << iter << " ; " << memory_use << std::endl;
+            runbatch(jet_array, razor_array, met_array, batch_begin, iter, max_njets, operations);
 
             // reset parameters
             operations = add_operations;
@@ -174,16 +174,16 @@ void runjobs(std::vector<TLorentzVector> **jet_array, double *razor_array,
  * Once these results are obtained run a second kernel to find the optimal
  * result for each event
  */
-void runbatch(std::vector<TLorentzVector> **jet_array, double *razor_array,
-              TLorentzVector *met_array, int ind1, int ind2, int max_size, int batch_size) {
+void runbatch(std::vector<Vector> **jet_array, double *razor_array,
+              Vector *met_array, int ind1, int ind2, int max_size, int batch_size) {
 
     int nevents = ind2 - ind1 - 1;
 
     // Create a contiguous (pseudo 2D) array of Lorentz Vectors
-    TLorentzVector *lv_array = new TLorentzVector[batch_size * max_size]; // initialized as (0,0,0,0)
+    Vector *lv_array = new Vector[batch_size * max_size]; // initialized as (0,0,0,0)
 
     // Create an array to keep all the MET copies
-    TLorentzVector *mets = new TLorentzVector[batch_size];
+    Vector *mets = new Vector[batch_size];
 
     // Create an array of all possible combinations of bit vectors of length max_size
     // bit vectors are just going to be implemented as the bits in an integer
@@ -206,20 +206,20 @@ void runbatch(std::vector<TLorentzVector> **jet_array, double *razor_array,
     }
 
     // move these two arrays to device memory
-    TLorentzVector *dev_lv_array;
-    TLorentzVector *dev_mets;
+    Vector *dev_lv_array;
+    Vector *dev_mets;
     uint *dev_combinations;
     double *dev_results;
 
-    cudaMalloc((void **) &dev_lv_array, batch_size * max_size * sizeof(TLorentzVector));
-    cudaMemcpy(lv_array, dev_lv_array, batch_size * max_size * sizeof(TLorentzVector),
+    cudaMalloc((void **) &dev_lv_array, batch_size * max_size * sizeof(Vector));
+    cudaMemcpy(lv_array, dev_lv_array, batch_size * max_size * sizeof(Vector),
         cudaMemcpyHostToDevice);
 
     cudaMalloc((void **) &dev_combinations, batch_size * sizeof(uint));
     cudaMemcpy(combinations, dev_combinations, batch_size * sizeof(uint), cudaMemcpyHostToDevice);
 
-    cudaMalloc((void **) &dev_mets, batch_size * sizeof(TLorentzVector));
-    cudaMemcpy(mets, dev_mets, batch_size * sizeof(TLorentzVector), cudaMemcpyHostToDevice);
+    cudaMalloc((void **) &dev_mets, batch_size * sizeof(Vector));
+    cudaMemcpy(mets, dev_mets, batch_size * sizeof(Vector), cudaMemcpyHostToDevice);
     
     cudaMalloc((void **) &dev_lv_array, 3 * batch_size * sizeof(double));
 
@@ -227,7 +227,7 @@ void runbatch(std::vector<TLorentzVector> **jet_array, double *razor_array,
 
     // Run kernel and obtain jet razor variables and mass information for each process
     // each process is going to be one possible jet partitioning
-    compute_razor(dev_lv_array, dev_combinations, dev_mets, dev_results, batch_size, max_size);
+    run_parallel_jobs(dev_lv_array, dev_combinations, dev_mets, dev_results, batch_size, max_size);
 
     cudaFree(dev_lv_array);
     cudaFree(dev_combinations);
@@ -254,27 +254,4 @@ void runbatch(std::vector<TLorentzVector> **jet_array, double *razor_array,
     cudaMemcpy(dev_opt_results, razor_array + ind1, 2 * nevents * sizeof(double), cudaMemcpyDeviceToHost);
 
     cudaFree(dev_opt_results);
-
-/*
-    // Copy results
-    double *results = new double[3 * batch_size];
-    cudaMemcpy(dev_results, results, 3 * batch_size * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaFree(dev_results);
-
-    // Iterate through results, looking for min mass parameter
-    uint min_ind; // index of min mass found
-    uint j = 0;   // event number
-    for (uint i = 0; i < batch_size; i++) {
-        if (i / uint(pow(jet_array[ind1 + i]->size(), 2)) % 2) {
-            double min_m = 0;
-            j++;
-            min_ind = 0;
-        }
-        for (uint k = 0; k < jet_array[ind1+i]->size(); k++) {
-            if
-        }
-        razor_array[j][0] = ;
-        razor_array[j][1] = ;
-    }
-*/
 }
