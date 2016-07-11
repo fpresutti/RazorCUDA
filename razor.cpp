@@ -1,7 +1,7 @@
 /*
  * This program is used to compute razor variables from a large dataset of
  * events by taking advantage of parallelization. Event data is read from a file
- * in json format containing, among other things, information about the jets.
+ * in json format that must contain an array of events including jets and met data.
  */
 
 #include <iostream>
@@ -18,9 +18,13 @@ typedef unsigned int uint;
 
 
 /*
- * Input: filename
- * Will attempt to read json format and fill jet vectors
- * Will then run razor variable computation in paralell on GPU
+ * Input: filename string
+ *
+ * Program will attempt to read json file and fill (C++) vectors of jet Vectors.
+ * Will then run razor variable computation in parallel on GPU for all possible
+ * combinations of jet partitions.
+ * Will then pick partition minimizing partition-hemisphere Vector magnitude^2,
+ * and output results.
  */
 int main (int argc, char **argv) {
 
@@ -67,7 +71,7 @@ int main (int argc, char **argv) {
     for (int i = 0; i < obj.size(); i++)
         delete jet_array[i];//, razor_array[i];
 
-    delete jet_array, razor_array;
+    delete jet_array, razor_array, met_array;
     std::cout  << "Success!" << std::endl;
     return 1;
 }
@@ -75,7 +79,7 @@ int main (int argc, char **argv) {
 
 
 /*
- * Read list of events from json file to and return array of vectors
+ * Read list of events from json file to and return array of vectors of jet Vectors
  */
 void parseJSON(Json::Value &obj, std::vector<Vector> **jet_array,
                Vector *met_array) {
@@ -177,7 +181,7 @@ void runjobs(std::vector<Vector> **jet_array, double *razor_array,
 void runbatch(std::vector<Vector> **jet_array, double *razor_array,
               Vector *met_array, int ind1, int ind2, int max_size, int batch_size) {
 
-    int nevents = ind2 - ind1 - 1;
+    int nevents = ind2 - ind1;
 
     // Create a contiguous (pseudo 2D) array of Lorentz Vectors
     Vector *lv_array = new Vector[batch_size * max_size]; // initialized as (0,0,0,0)
@@ -190,20 +194,31 @@ void runbatch(std::vector<Vector> **jet_array, double *razor_array,
     uint *combinations = new uint[batch_size];
 
     // Store size of the vector for each event for convenience
-    int *event_batch_sizes = new int[nevents];
-    for (int i = 0; i < nevents; i++)
-        event_batch_sizes[i] = jet_array[i]->size();
+    int *event_jet_num = new int[nevents];
+    for (int i = 0; i < nevents; i++) {
+        event_jet_num[i] = jet_array[ind1 + i]->size();
+        std::cout << "jets: " << event_jet_num[i] << std::endl;
+    }
+
+    std::cout << "Filling contiguous arrays. Batch Size: " << batch_size << std::endl;  
 
     // Some indexing ninjutsu to fill these arrays
+    uint event_tracker = uint(pow(2, event_jet_num[0]));
     uint j = 0;
-    for (uint i = 0; i < batch_size; i++) {                         // loop through all processes
-        j += !!(i / uint(pow(event_batch_sizes[ind1 + i], 2)));     // keep track of events
-        for (uint k = 0; k < event_batch_sizes[ind1 + i]; k++) {    // loop through vectors
-            lv_array[i*max_size + k] = jet_array[ind1 + j]->at(k);
-            combinations[i*max_size + k] = k;
-            mets[i*max_size + k] = met_array[ind1 + j];
+    for (uint i = 0; i < batch_size; i++) {                 // loop through all processes
+        if (i - event_tracker == 0) {                       // keep track of events
+            j++;
+            event_tracker += uint(pow(2, event_jet_num[j]));
         }
+        for (uint k = 0; k < event_jet_num[j]; k++) {       // loop through Vectors
+            std::cout << i << ", " << j << ", " << k << std::endl;
+            lv_array[i*max_size + k] = jet_array[ind1 + j]->at(k);
+        }
+        combinations[i] = i - event_tracker;
+        mets[i] = met_array[ind1 + j];
     }
+
+    std::cout << "Moving to device memory" << std::endl;
 
     // move these two arrays to device memory
     Vector *dev_lv_array;
@@ -221,13 +236,15 @@ void runbatch(std::vector<Vector> **jet_array, double *razor_array,
     cudaMalloc((void **) &dev_mets, batch_size * sizeof(Vector));
     cudaMemcpy(mets, dev_mets, batch_size * sizeof(Vector), cudaMemcpyHostToDevice);
     
-    cudaMalloc((void **) &dev_lv_array, 3 * batch_size * sizeof(double));
+    cudaMalloc((void **) &dev_results, 3 * batch_size * sizeof(double));
 
     delete lv_array, combinations, mets;
 
     // Run kernel and obtain jet razor variables and mass information for each process
     // each process is going to be one possible jet partitioning
+    std::cout << "Running jobs in parallel" << std::endl; 
     run_parallel_jobs(dev_lv_array, dev_combinations, dev_mets, dev_results, batch_size, max_size);
+    std::cout << "Done" << std::endl;
 
     cudaFree(dev_lv_array);
     cudaFree(dev_combinations);
@@ -237,21 +254,27 @@ void runbatch(std::vector<Vector> **jet_array, double *razor_array,
     // dev_results still in gpu memory
 
     // move size info to device memory
-    int *dev_event_batch_sizes;
-    cudaMalloc((void **) &dev_event_batch_sizes, nevents * sizeof(int));
-    cudaMemcpy(event_batch_sizes, dev_event_batch_sizes, nevents * sizeof(int), cudaMemcpyHostToDevice);
+    int *dev_event_jet_num;
+    cudaMalloc((void **) &dev_event_jet_num, nevents * sizeof(int));
+    cudaMemcpy(event_jet_num, dev_event_jet_num, nevents * sizeof(int), cudaMemcpyHostToDevice);
 
-    delete event_batch_sizes;
+    delete event_jet_num;
 
     // new array to store optimal results
     double *dev_opt_results;
     cudaMalloc((void **) &dev_opt_results, 2 * nevents * sizeof(double));
 
     // Run second kernel to find optimal razor variables
-    find_optimum(dev_results, dev_event_batch_sizes, dev_opt_results, nevents);
+    std:: cout << "Finding optimal razor variables for each event" << std::endl;
+    find_optimum(dev_results, dev_event_jet_num, dev_opt_results, nevents);
+    std::cout << "Done" << std::endl;
 
     // Copy results to host
     cudaMemcpy(dev_opt_results, razor_array + ind1, 2 * nevents * sizeof(double), cudaMemcpyDeviceToHost);
 
     cudaFree(dev_opt_results);
+
+    for (int i = ind1; i < 2*ind2; i+=2)
+        std::cout << razor_array[i] << " " << razor_array[i+1];
+
 }
