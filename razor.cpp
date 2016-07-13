@@ -6,16 +6,30 @@
 
 #include <iostream>
 #include <fstream>
+
+#ifndef CPU
 #include <cuda_runtime.h>
+#endif
 
 #include "include/razor.h"
 
 typedef unsigned int uint;
 
 // limit on GPU memory restraining number of tasks to be run in parallel
-#define GPUMEM 12000 // currently picked at random
-#define GPUCORES 100
+#define GPUMEM   200000 // 12000000000
+#define GPUCORES 200  // 3000
+#define GPUNUM   1
 
+// Error checking with CUDA
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 /*
  * Input: filename string
@@ -43,18 +57,13 @@ int main (int argc, char **argv) {
         return 0;
     }
 
-    std::cout << "Reading file..." << std::endl;
     // Create array of vectors to store jet data and razor variables later
     std::cout << "Dataset Size: " << obj.size() << std::endl;
 
     std::vector<Vector> **jet_array = new std::vector<Vector> *[obj.size()];
     Vector *met_array = new Vector[obj.size()];
     double *razor_array = new double[2 * obj.size()];
-/*
-    double **razor_array = new double *[obj.size()];
-    for (int i = 0; i < obj.size(); i++)
-        razor_array[i] = new double[2];
-*/
+
     // fill vectors
     std::cout << "Filling vectors in memory with data from file" << std::endl;
     parseJSON(obj, jet_array, met_array);
@@ -64,18 +73,18 @@ int main (int argc, char **argv) {
     runjobs(jet_array, razor_array, met_array, obj.size());
     std::cout << "Finished parallel computations" << std::endl;
 
+    /*
     // output razor array results:
-    for (int i = 0; i < obj.size(); i += 2)
-        std::cout << "MR" << razor_array[i] << "R2" << razor_array[i+1] << std::endl;
-
+    for (int i = 0; i < 2*obj.size(); i += 2)
+        std::cout << "MR: " << razor_array[i] << ", R2: " << razor_array[i+1] << std::endl;
+    */
     for (int i = 0; i < obj.size(); i++)
-        delete jet_array[i];//, razor_array[i];
+        delete jet_array[i];
 
     delete jet_array, razor_array, met_array;
-    std::cout  << "Success!" << std::endl;
+
     return 1;
 }
-
 
 
 /*
@@ -97,9 +106,6 @@ void parseJSON(Json::Value &obj, std::vector<Vector> **jet_array,
 
             Vector vec;
             
-            //std::cout << (*jet_iter)["pt"].asDouble() << " " << (*jet_iter)["eta"].asDouble()
-            //   << " " << (*jet_iter)["phi"].asDouble() << " " << (*jet_iter)["m"].asDouble() << std::endl;
-            
             vec.SetPtEtaPhi(
                     (*jet_iter)["pt"].asDouble() ,
                     (*jet_iter)["eta"].asDouble(),
@@ -109,14 +115,15 @@ void parseJSON(Json::Value &obj, std::vector<Vector> **jet_array,
 
         // obtain MET from event
         met_array[index].SetPtEtaPhi(
-                    (*iter)["pt"].asDouble() , 0,
-                    (*iter)["phi"].asDouble());
+                    (*iter)["event"]["met"]["pt"].asDouble(), 0,
+                    (*iter)["event"]["met"]["phi"].asDouble());
     }
 }
 
+#ifndef CPU
 
 /*
- * Run data analysis in parallel in batches, based on available GPU memory
+ * Run data analysis in parallel in batches, based on available GPU cores/memory
  */
 void runjobs(std::vector<Vector> **jet_array, double *razor_array,
              Vector *met_array, int tot_size) {
@@ -135,7 +142,7 @@ void runjobs(std::vector<Vector> **jet_array, double *razor_array,
         int njets = jet_array[iter]->size();
 
         // additional operations needed to be performed with this vector
-        int add_operations = pow(2, njets); // +1 because 2 hemispheres
+        int add_operations = pow(2, njets);
 
         // overall memory to be used by this batch of vectors, pick max
         // see runbatch function: batch # * combination * result * vector arrays
@@ -144,7 +151,7 @@ void runjobs(std::vector<Vector> **jet_array, double *razor_array,
                     * (1 + (max_njets < njets ? njets : max_njets)));
 
         // If there is enough memory left, add vector to batch and continue
-        if (memory_use < GPUMEM && operations < GPUCORES) {
+        if (memory_use < GPUMEM && operations + add_operations < GPUCORES) {
 
             operations += add_operations;
 
@@ -156,13 +163,13 @@ void runjobs(std::vector<Vector> **jet_array, double *razor_array,
         else {
 
             // run computation on these -- nb: 2nd index not inclusive
-            std::cout << "Processing: " << batch_begin << " - " << iter << " ; " << memory_use << std::endl;
+            //std::cout << "Processing: " << batch_begin << " - " << iter << " ; " << operations << std::endl;
             runbatch(jet_array, razor_array, met_array, batch_begin, iter, max_njets, operations);
 
             // reset parameters
             operations = add_operations;
             max_njets = njets;
-            batch_begin = iter++;
+            batch_begin = iter;
         }
     }
     // run last batch
@@ -195,30 +202,26 @@ void runbatch(std::vector<Vector> **jet_array, double *razor_array,
 
     // Store size of the vector for each event for convenience
     int *event_jet_num = new int[nevents];
-    for (int i = 0; i < nevents; i++) {
+    for (int i = 0; i < nevents; i++)
         event_jet_num[i] = jet_array[ind1 + i]->size();
-        std::cout << "jets: " << event_jet_num[i] << std::endl;
-    }
-
-    std::cout << "Filling contiguous arrays. Batch Size: " << batch_size << std::endl;  
 
     // Some indexing ninjutsu to fill these arrays
-    uint event_tracker = uint(pow(2, event_jet_num[0]));
-    uint j = 0;
+    uint j = ind1;
+    uint event_tracker = uint(pow(2, event_jet_num[j-ind1]));
     for (uint i = 0; i < batch_size; i++) {                 // loop through all processes
-        if (i - event_tracker == 0) {                       // keep track of events
+        if (event_tracker - i == 0) {                       // keep track of events
             j++;
-            event_tracker += uint(pow(2, event_jet_num[j]));
+            event_tracker += uint(pow(2, event_jet_num[j-ind1]));
         }
-        for (uint k = 0; k < event_jet_num[j]; k++) {       // loop through Vectors
-            std::cout << i << ", " << j << ", " << k << std::endl;
-            lv_array[i*max_size + k] = jet_array[ind1 + j]->at(k);
+        for (uint k = 0; k < event_jet_num[j-ind1]; k++) {  // loop through Vectors
+            //std::cout << i << ", " << j << ", " << k << std::endl;
+            lv_array[i*max_size + k] = jet_array[j]->at(k);
         }
-        combinations[i] = i - event_tracker;
-        mets[i] = met_array[ind1 + j];
+        combinations[i] = event_tracker - i - 1;
+        mets[i] = met_array[j];
     }
 
-    std::cout << "Moving to device memory" << std::endl;
+    cudaSetDevice(GPUNUM);
 
     // move these two arrays to device memory
     Vector *dev_lv_array;
@@ -226,55 +229,133 @@ void runbatch(std::vector<Vector> **jet_array, double *razor_array,
     uint *dev_combinations;
     double *dev_results;
 
-    cudaMalloc((void **) &dev_lv_array, batch_size * max_size * sizeof(Vector));
-    cudaMemcpy(lv_array, dev_lv_array, batch_size * max_size * sizeof(Vector),
-        cudaMemcpyHostToDevice);
+    gpuErrchk( cudaMalloc((void **) &dev_lv_array, batch_size * max_size * sizeof(Vector)) );
+    gpuErrchk( cudaMemcpy(dev_lv_array, lv_array, batch_size * max_size * sizeof(Vector), cudaMemcpyHostToDevice) );
 
-    cudaMalloc((void **) &dev_combinations, batch_size * sizeof(uint));
-    cudaMemcpy(combinations, dev_combinations, batch_size * sizeof(uint), cudaMemcpyHostToDevice);
+    gpuErrchk( cudaMalloc((void **) &dev_combinations, batch_size * sizeof(uint)) );
+    gpuErrchk( cudaMemcpy(dev_combinations, combinations, batch_size * sizeof(uint), cudaMemcpyHostToDevice) );
 
-    cudaMalloc((void **) &dev_mets, batch_size * sizeof(Vector));
-    cudaMemcpy(mets, dev_mets, batch_size * sizeof(Vector), cudaMemcpyHostToDevice);
+    gpuErrchk( cudaMalloc((void **) &dev_mets, batch_size * sizeof(Vector)) );
+    gpuErrchk( cudaMemcpy(dev_mets, mets, batch_size * sizeof(Vector), cudaMemcpyHostToDevice) );
     
-    cudaMalloc((void **) &dev_results, 3 * batch_size * sizeof(double));
+    gpuErrchk( cudaMalloc((void **) &dev_results, 3 * batch_size * sizeof(double)) );
 
     delete lv_array, combinations, mets;
 
     // Run kernel and obtain jet razor variables and mass information for each process
     // each process is going to be one possible jet partitioning
-    std::cout << "Running jobs in parallel" << std::endl; 
+    gpuErrchk( cudaThreadSynchronize() );
     run_parallel_jobs(dev_lv_array, dev_combinations, dev_mets, dev_results, batch_size, max_size);
-    std::cout << "Done" << std::endl;
+    gpuErrchk( cudaThreadSynchronize() );
 
-    cudaFree(dev_lv_array);
-    cudaFree(dev_combinations);
-    cudaFree(dev_mets);
-
+    gpuErrchk( cudaFree(dev_lv_array) );
+    gpuErrchk( cudaFree(dev_combinations) );
+    gpuErrchk( cudaFree(dev_mets) );
+/*
     // Now that this is done we use the gpu to find the optima;
     // dev_results still in gpu memory
 
     // move size info to device memory
     int *dev_event_jet_num;
-    cudaMalloc((void **) &dev_event_jet_num, nevents * sizeof(int));
-    cudaMemcpy(event_jet_num, dev_event_jet_num, nevents * sizeof(int), cudaMemcpyHostToDevice);
+    gpuErrchk( cudaMalloc((void **) &dev_event_jet_num, nevents * sizeof(int)));
+    gpuErrchk( cudaMemcpy(dev_event_jet_num, event_jet_num, nevents * sizeof(int), cudaMemcpyHostToDevice));
 
     delete event_jet_num;
 
     // new array to store optimal results
     double *dev_opt_results;
-    cudaMalloc((void **) &dev_opt_results, 2 * nevents * sizeof(double));
+    gpuErrchk( cudaMalloc((void **) &dev_opt_results, 2 * nevents * sizeof(double)) );
 
     // Run second kernel to find optimal razor variables
     std:: cout << "Finding optimal razor variables for each event" << std::endl;
+    gpuErrchk( cudaThreadSynchronize() );
     find_optimum(dev_results, dev_event_jet_num, dev_opt_results, nevents);
+    gpuErrchk( cudaThreadSynchronize() );
     std::cout << "Done" << std::endl;
 
+    gpuErrchk( cudaFree(dev_event_jet_num) );
+
     // Copy results to host
-    cudaMemcpy(dev_opt_results, razor_array + ind1, 2 * nevents * sizeof(double), cudaMemcpyDeviceToHost);
+    std:: cout << "Copying results to host" << std::endl;
+    gpuErrchk( cudaMemcpy(razor_array + ind1, dev_opt_results, 2 * nevents * sizeof(double), cudaMemcpyDeviceToHost) );
+    std:: cout << "Done" << std::endl;
 
-    cudaFree(dev_opt_results);
+    gpuErrchk( cudaFree(dev_opt_results) );
+*/
 
-    for (int i = ind1; i < 2*ind2; i+=2)
-        std::cout << razor_array[i] << " " << razor_array[i+1];
+    // Copy results
+    double *results = new double[3 * batch_size];
+    cudaMemcpy(results, dev_results, 3 * batch_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dev_results);
 
+    // Iterate through results, looking for min magnitude parameter
+    double mMin = 9e300; // big ol' number to start with
+    j = ind1;
+    event_tracker = uint(pow(2, event_jet_num[j-ind1]));
+    //std::cout << j << ": (" << event_jet_num[j-ind1] << ") " << std::endl;
+    for (uint i = 0; i < batch_size; i++) {
+        if (event_tracker - i == 0) { // reset at new j index
+            j++;
+            event_tracker += uint(pow(2, event_jet_num[j-ind1]));
+            mMin = 9e300;
+            //std::cout << j << ": (" << event_jet_num[j-ind1] << ") " << std::endl;
+        }
+        if (results[3*i + 2] < mMin && results[3*i + 2] != 0) { // found lower value
+            mMin = results[3*i + 2];
+            razor_array[2*j]   = results[3*i];   // obtain m_r
+            razor_array[2*j+1] = results[3*i+1]; // obtain r^2
+        }
+    }
+
+    delete event_jet_num, results;
 }
+
+#else
+
+/*
+ * Run data analysis serially on CPU
+ */
+void runjobs(std::vector<Vector> **jet_array, double *razor_array,
+             Vector *met_array, int tot_size) {
+
+    for (int event = 0; event < tot_size; event++) {
+        // obscure code from razor analysis
+        int nComb = pow(2, jet_array[event]->size());
+        int j_count;
+        double bestmag2 = 9e300;
+        Vector best1, best2;
+        for (int i = 1; i < nComb - 1; i++) {
+            Vector j_temp1, j_temp2;
+            int itemp = i;
+            j_count = nComb / 2;
+            int count = 0;
+            while (j_count > 0) {
+                if (itemp / j_count == 1) {
+                    j_temp1 += jet_array[event]->at(count);
+                }
+                else {
+                    j_temp2 += jet_array[event]->at(count);
+                }
+                itemp -= j_count * (itemp / j_count);
+                j_count /= 2;
+                count++;
+            }
+            // Check mag^2 and see if better new razor variables
+            if (j_temp1.P2() + j_temp2.P2() < bestmag2) {
+                bestmag2 = best1.P2() + best2.P2();
+                best1 = j_temp1;
+                best2 = j_temp2;
+            }
+        }
+        // fill results with this vector's crazor variables
+        double mR = sqrt(pow(best1.P() + best2.P(), 2) - pow(best1.Pz() + best2.Pz(), 2));;
+        double term1 = met_array[event].Pt() / 2 * (best1.Pt() + best2.Pt());
+        double term2 = met_array[event].Px() / 2 * (best1.Px() + best2.Px())
+                + met_array[event].Py() / 2 * (best1.Py() + best2.Py());
+        double mTR = sqrt(term1 - term2);
+        razor_array[2*event] = mR;
+        razor_array[2*event+1] = (mTR / mR) * (mTR / mR);
+    }
+}
+
+#endif

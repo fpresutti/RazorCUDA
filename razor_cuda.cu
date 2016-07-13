@@ -20,11 +20,11 @@ class Vector {
         __device__ double Pt() {return sqrt(px*px + py*py);};
         __device__ double P()  {return sqrt(px*px + py*py + pz*pz);};
         __device__ double P2() {return px*px + py*py + pz*pz;};
-        __device__ Vector () {
+        __device__ Vector() {
             px = 0;
             py = 0;
             pz = 0;
-        }
+        };
         __device__ Vector(double a, double b, double c) {
             px = a;
             py = b;
@@ -45,8 +45,7 @@ class Vector {
  * Compute the two razor variables, M_R and R^2, and the sum of p magnitude^2
  */
  __device__
-void compute_razor(Vector hem1, Vector hem2,
-        Vector pfMet, double *result) {
+void compute_razor(Vector hem1, Vector hem2, Vector pfMet, double *result) {
     double mR = sqrt(pow(hem1.P() + hem2.P(), 2) - pow(hem1.Pz() + hem2.Pz(), 2));;
     double term1 = pfMet.Pt() / 2 * (hem1.Pt() + hem2.Pt());
     double term2 = pfMet.Px() / 2 * (hem1.Px() + hem2.Px()) + pfMet.Py() / 2 * (hem1.Py() + hem2.Py());
@@ -59,7 +58,7 @@ void compute_razor(Vector hem1, Vector hem2,
 /*
  * GPU Kernels
  * razor_kernel: compute razor variables for all blocks
- * pick_kernel:  iterate through these results and pick result based on mass
+ * pick_kernel:  iterate through these results and pick result based on magnitude
  */
 __global__ void razor_kernel(Vector *lv_array, uint *combinations,
                   Vector *mets, double *results, int vector_size) {
@@ -70,7 +69,7 @@ __global__ void razor_kernel(Vector *lv_array, uint *combinations,
         hem2 += (lv_array[blockIdx.x*vector_size + i] * (0x1 & ~bitvector));
         bitvector >>= 1;
     }
-    compute_razor(hem1, hem2, mets[blockIdx.x], &results[3*blockIdx.x]);
+    compute_razor(hem1, hem2, mets[blockIdx.x], results + 3*blockIdx.x);
 }
 
 __global__ void pick_kernel(double *all_results, int *event_sizes, double *opt_results) {
